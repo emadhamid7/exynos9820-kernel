@@ -1,0 +1,186 @@
+name: Build ExtremeKernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version, e.g. 1.2 (blank = auto)"
+        required: false
+        default: ""
+      gofile:
+        description: "Upload zips to Gofile"
+        type: boolean
+        default: true
+      release:
+        description: "Publish a GitHub release"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  # ---------------------------------------------------------------- setup
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      tag: ${{ steps.v.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: arch/arm64/configs
+          sparse-checkout-cone-mode: true
+
+      - name: Work out version + tag
+        id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          INPUT="${INPUT_VERSION#v}"
+          LV=$(grep -o 'CONFIG_LOCALVERSION="[^"]*"' arch/arm64/configs/exynos9820_defconfig | cut -d'"' -f2 || true)
+          FROM_CFG=$(echo "$LV" | grep -oE '[0-9]+(\.[0-9]+)+' | head -n1 || true)
+
+          if [ -n "$INPUT" ]; then
+            VERSION="$INPUT"
+            TAG="v$VERSION"
+          else
+            VERSION="${FROM_CFG:-$(date -u +%Y.%m.%d)}"
+            TAG="v$VERSION-build${{ github.run_number }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- build
+  build:
+    name: build ${{ matrix.model }}
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        model: [beyond0lte, beyond1lte, beyond2lte, beyondx, d1, d1xks, d2s, d2x, d2xks]
+    env:
+      MODEL: ${{ matrix.model }}
+      VERSION: ${{ needs.setup.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev libelf-dev libncurses-dev cpio zip curl \
+            patchelf xz-utils zstd lz4 python3 rsync dwarves
+
+      - name: Cache toolchain (Neutron clang 18)
+        uses: actions/cache@v4
+        with:
+          path: toolchain/neutron_18
+          key: neutron18-05012024-${{ runner.os }}
+
+      # "ExtremeKernel Unofficial" -> "ExtremeKernel"
+      - name: Rename "ExtremeKernel Unofficial" -> "ExtremeKernel"
+        run: |
+          git grep -Ili 'extremekernel[ _-]*unofficial' -- . ':(exclude)Documentation' \
+            | xargs -r sed -i -E 's/(ExtremeKernel)[ _-]*Unofficial/\1/Ig'
+          sed -i -E 's/_UNOFFICIAL//g' build.sh build_kernel.sh 2>/dev/null || true
+
+      - name: Build
+        run: |
+          chmod +x build.sh build_kernel.sh toolchain/mkdtimg toolchain/mkbootimg 2>/dev/null || true
+          ./build.sh -m "$MODEL" -k y -r n
+
+      - name: Collect zip
+        run: |
+          SRC=$(ls build/out/*/*.zip | head -n1)
+          mkdir -p dist
+          cp "$SRC" "dist/ExtremeKernel-${VERSION}_${MODEL}.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExtremeKernel-${{ matrix.model }}
+          path: dist/*.zip
+          compression-level: 0
+          retention-days: 30
+          if-no-files-found: error
+
+  # --------------------------------------------------------------- gofile
+  gofile:
+    needs: build
+    if: ${{ !cancelled() && needs.build.result == 'success' && inputs.gofile }}
+    runs-on: ubuntu-latest
+    outputs:
+      link: ${{ steps.up.outputs.link }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ExtremeKernel-*
+          merge-multiple: true
+          path: dist
+
+      - name: Upload to Gofile
+        id: up
+        env:
+          GOFILE_TOKEN: ${{ secrets.GOFILE_TOKEN }}   # optional; blank = guest upload
+        run: |
+          set -euo pipefail
+          FOLDER=""; PAGE=""
+          AUTH=()
+          [ -n "${GOFILE_TOKEN:-}" ] && AUTH=(-H "Authorization: Bearer $GOFILE_TOKEN")
+
+          for f in dist/*.zip; do
+            echo "Uploading $f"
+            ARGS=("${AUTH[@]}")
+            [ -n "$FOLDER" ] && ARGS+=(-F "folderId=$FOLDER")
+            RES=$(curl -fsS --retry 3 --retry-delay 5 "${ARGS[@]}" \
+                  -F "file=@$f" https://upload.gofile.io/uploadfile)
+            jq -e '.status == "ok"' <<<"$RES" >/dev/null || { echo "$RES"; exit 1; }
+
+            if [ -z "$FOLDER" ]; then
+              FOLDER=$(jq -r '.data.parentFolder' <<<"$RES")
+              PAGE=$(jq -r '.data.downloadPage' <<<"$RES")
+              if [ -z "${GOFILE_TOKEN:-}" ]; then
+                GT=$(jq -r '.data.guestToken' <<<"$RES")
+                echo "::add-mask::$GT"
+                AUTH=(-H "Authorization: Bearer $GT")
+              fi
+            fi
+          done
+
+          echo "link=$PAGE" >> "$GITHUB_OUTPUT"
+          { echo "### Gofile"; echo "$PAGE"; } >> "$GITHUB_STEP_SUMMARY"
+
+  # -------------------------------------------------------------- release
+  release:
+    needs: [setup, build, gofile]
+    if: ${{ !cancelled() && needs.build.result == 'success' && inputs.release }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ExtremeKernel-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.setup.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: ExtremeKernel ${{ needs.setup.outputs.version }}
+          files: dist/*.zip
+          generate_release_notes: true
+          body: |
+            ## ExtremeKernel ${{ needs.setup.outputs.version }}
+
+            Exynos 9820 / 9825 (Galaxy S10 / Note10 series)
+            KernelSU-Next included. Flash the zip matching your model.
+
+            ${{ needs.gofile.outputs.link && format('Mirror (Gofile): {0}', needs.gofile.outputs.link) || '' }}
