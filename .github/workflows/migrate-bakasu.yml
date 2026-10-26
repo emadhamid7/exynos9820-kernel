@@ -20,7 +20,9 @@ jobs:
           submodules: false
 
       - name: Run migration
+        shell: bash {0}
         run: |
+          set +e
           set -uo pipefail
           
           REF_URL="https://github.com/Kernels-by-ravindu644/samsung_kernel_exynos9820_extremerom"
