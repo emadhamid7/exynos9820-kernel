@@ -34,7 +34,7 @@ jobs:
           REF="refs/remotes/ref/${REF_BRANCH}"
           
           # hooks: only hunks that touch "ksu" lines are copied from the reference
-          HOOKS_KSU_ONLY="fs/exec.c fs/open.c fs/stat.c fs/read_write.c kernel/reboot.c kernel/sys.c drivers/input/input.c"
+          HOOKS_KSU_ONLY="fs/open.c fs/stat.c fs/read_write.c kernel/reboot.c kernel/sys.c drivers/input/input.c"
           # selinux static->non-static exports: all hunks copied (BakaSU needs them)
           HOOKS_ALL="security/selinux/selinuxfs.c security/selinux/ss/services.c security/selinux/ss/status.c security/selinux/hooks.c"
           
@@ -138,6 +138,75 @@ jobs:
           EOF
           for f in $HOOKS_KSU_ONLY; do printf '%-36s ' "$f"; $PY /tmp/hunkpick.py ksu "$REF" "$f"; done
           for f in $HOOKS_ALL;      do printf '%-36s ' "$f"; $PY /tmp/hunkpick.py all "$REF" "$f"; done
+          printf '%-36s ' "fs/exec.c (in-place)"
+          cat > /tmp/fixexec.py <<'PYEOF'
+          import re, sys
+          p = "fs/exec.c"
+          L = open(p).read().split("\n")
+          
+          # 1) drop old KernelSU(-Next) #if blocks that mention ksu (never touch ones with #else)
+          def strip_blocks(lines):
+              res, i = [], 0
+              while i < len(lines):
+                  if re.match(r'\s*#\s*if.*CONFIG_KSU', lines[i]):
+                      depth, j, has_else = 1, i + 1, False
+                      while j < len(lines) and depth:
+                          t = lines[j]
+                          if re.match(r'\s*#\s*if', t): depth += 1
+                          elif re.match(r'\s*#\s*endif', t): depth -= 1
+                          elif depth == 1 and re.match(r'\s*#\s*(else|elif)', t): has_else = True
+                          j += 1
+                      blk = lines[i:j]
+                      if has_else:
+                          print("WARN: #else in KSU block at line %d, left alone" % (i + 1))
+                      elif any('ksu' in b.lower() for b in blk):
+                          i = j; continue
+                  res.append(lines[i]); i += 1
+              return res
+          L = strip_blocks(L)
+          
+          # 2) find the real execve worker: the definition whose body uses bprm
+          defs = [i for i, l in enumerate(L) if re.match(r'static int (__do_execve_file|do_execveat_common)\(', l)]
+          target = None
+          for d in defs:
+              end = next((k for k in range(d, len(L)) if L[k] == "}"), len(L))
+              if any('bprm' in x for x in L[d:end]):
+                  target, tend = d, end; break
+          if target is None:
+              print("FAIL: cannot find execve worker function"); sys.exit(1)
+          print("worker: line %d: %s" % (target + 1, L[target]))
+          
+          # 3) hooks inside the body (do bottom-up so indexes stay valid)
+          body = range(target, tend)
+          isx = next((k for k in body if re.match(r'\s*if \(IS_ERR\(filename\)\)', L[k])), None)
+          out = next((k for k in body if re.match(r'\s*out_ret:', L[k])), None)
+          if isx is None or out is None:
+              print("FAIL: anchors missing (IS_ERR check: %s, out_ret label: %s)" % (isx, out)); sys.exit(1)
+          L[out+1:out+1] = [
+           "#ifdef CONFIG_KSU_MANUAL_HOOK",
+           "\tif (filename)",
+           "\t\tksu_handle_post_execveat(&fd, &filename, &argv, &envp, &flags, &retval);",
+           "#endif"]
+          L[isx:isx] = [
+           "#ifdef CONFIG_KSU_MANUAL_HOOK",
+           "\tif (filename)",
+           "\t\tksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);",
+           "#endif",
+           ""]
+          L[target:target] = [
+           "#ifdef CONFIG_KSU_MANUAL_HOOK",
+           "__attribute__((hot))",
+           "extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,",
+           "\t\t\t\tvoid *argv, void *envp, int *flags);",
+           "__attribute__((hot))",
+           "extern int ksu_handle_post_execveat(int *fd, struct filename **filename_ptr,",
+           "\t\t\t\tvoid *argv, void *envp, int *flags, int *retval);",
+           "#endif",
+           ""]
+          open(p, "w").write("\n".join(L))
+          print("exec hooks inserted")
+          PYEOF
+          $PY /tmp/fixexec.py
           REJ=$(find . -name '*.rej' -not -path './.git/*' 2>/dev/null)
           [ -n "$REJ" ] && { warn "rejected hunks (fix by hand or paste them to me):"; echo "$REJ"; }
           
