@@ -1,0 +1,53 @@
+name: OC recon 2 (read-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to scan"
+        default: "bakasu-migration"
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 1
+
+      - name: Dump thermal, GPU, CPU table sections
+        shell: bash {0}
+        run: |
+          D=arch/arm64/boot/dts/exynos/exynos9820.dts
+          S() { echo; echo "######## $*"; }
+          {
+          S "thermal-zones: where"
+          grep -n 'thermal-zones' $D arch/arm64/boot/dts/exynos/*.dts* arch/arm64/boot/dts/samsung/*.dts* 2>/dev/null | head
+          S "thermal trips in $D (filtered)"
+          L=$(grep -n 'thermal-zones' $D | head -1 | cut -d: -f1)
+          [ -n "$L" ] && tail -n +$L $D | head -900 | grep -nE '^\s*[A-Za-z0-9_-]+\s*\{|temperature|hysteresis|type\s*=|polling|cooling-device|sustainable' | head -300
+
+          S "GPU dvfs table (mali_common + samsung/mali)"
+          for f in arch/arm64/boot/dts/exynos/exynos9820-mali_common.dtsi arch/arm64/boot/dts/samsung/exynos9820-mali.dtsi; do
+            echo "--- $f"; sed -n '1,80p' $f
+          done
+
+          S "CPU sections of $D"
+          echo "--- 4890-4915"; sed -n '4890,4915p' $D
+          echo "--- 5095-5180"; sed -n '5095,5180p' $D
+          echo "--- 5195-5330"; sed -n '5195,5330p' $D
+
+          S "How rates/voltages are obtained (ECT or source?)"
+          grep -rnE 'ect_get_block|ect_parse|ect_dvfs' drivers/soc/samsung/cal-if/*.c drivers/soc/samsung/cal-if/exynos9820/*.c drivers/cpufreq/exynos-acme.c 2>/dev/null | head -30
+          grep -nE 'g3d|G3D' drivers/soc/samsung/cal-if/exynos9820/cmucal-vclklut.c | head -20
+          grep -rnE 'ect' drivers/soc/samsung/cal-if/cal-if.c 2>/dev/null | head -20
+          ls drivers/soc/samsung | grep -i ect
+          } > recon2.txt 2>&1
+          wc -l recon2.txt
+          cat recon2.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oc-recon2
+          path: recon2.txt
