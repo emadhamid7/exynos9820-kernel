@@ -1,0 +1,58 @@
+name: OC recon 3 (read-only, diff vs Creeeeger OC kernel)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to compare"
+        default: "bakasu-migration"
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 1
+
+      - name: Diff OC-relevant files against Creeeeger/9820_kernel
+        shell: bash {0}
+        run: |
+          S() { echo; echo "######## $*"; }
+          git remote add oc https://github.com/Creeeeger/9820_kernel
+          git fetch --depth=1 --filter=blob:none oc main || exit 1
+          OC=refs/remotes/oc/main
+          {
+          S "forOC contents"
+          git ls-tree -r -l $OC forOC | head -60
+          for f in $(git ls-tree -r --name-only $OC forOC | head -40); do
+            sz=$(git cat-file -s $OC:$f 2>/dev/null || echo 0)
+            case "$f" in
+              *.md|*.txt|*.sh|*.dts*|*.dtsi|*.h|*.c|*.patch|*.diff|*.json|*.yml|*.yaml)
+                if [ "$sz" -lt 30000 ]; then echo; echo "=== $f ($sz bytes)"; git show $OC:$f | head -250; fi ;;
+            esac
+          done
+
+          for f in arch/arm64/boot/dts/exynos/exynos9820.dts \
+                   arch/arm64/boot/dts/exynos/exynos9820-mali_common.dtsi \
+                   arch/arm64/boot/dts/samsung/exynos9820-mali.dtsi \
+                   drivers/cpufreq/exynos-acme.c \
+                   drivers/soc/samsung/ect_parser.c \
+                   drivers/gpu/arm/b_r10p0/platform/exynos/gpu_dvfs_governor.c; do
+            S "DIFF mine -> Creeeeger: $f"
+            git diff --no-color -U2 HEAD $OC -- "$f" | head -400
+          done
+
+          S "Workflow/build hints in Creeeeger repo (OC inputs)"
+          for f in $(git ls-tree -r --name-only $OC .github/workflows | head -5); do
+            echo "=== $f"; git show $OC:$f | grep -niE 'oc|gpu|cpu|freq|thermal|ect' | head -60
+          done
+          } > recon3.txt 2>&1
+          wc -l recon3.txt
+          head -c 60000 recon3.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oc-recon3
+          path: recon3.txt
