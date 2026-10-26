@@ -1,0 +1,198 @@
+name: Migrate to BakaSU
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to push the migration to"
+        default: "bakasu-migration"
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      - name: Run migration
+        run: |
+          set -uo pipefail
+          
+          REF_URL="https://github.com/Kernels-by-ravindu644/samsung_kernel_exynos9820_extremerom"
+          REF_BRANCH="main"
+          BAKA_URL="https://github.com/Baka-SU/BakaSU"
+          BAKA_BRANCH="main"
+          OLD_SM="KernelSU-Next"
+          NEW_SM="KernelSU"
+          REF="refs/remotes/ref/${REF_BRANCH}"
+          
+          # hooks: only hunks that touch "ksu" lines are copied from the reference
+          HOOKS_KSU_ONLY="fs/exec.c fs/open.c fs/stat.c fs/read_write.c kernel/reboot.c kernel/sys.c drivers/input/input.c"
+          # selinux static->non-static exports: all hunks copied (BakaSU needs them)
+          HOOKS_ALL="security/selinux/selinuxfs.c security/selinux/ss/services.c security/selinux/ss/status.c security/selinux/hooks.c"
+          
+          say()  { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
+          warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*"; }
+          ok()   { printf '\033[1;32m[ OK ]\033[0m %s\n' "$*"; }
+          
+          [ -f Makefile ] && [ -d drivers ] && [ -d .git ] || { echo "Run from the kernel repo root."; exit 1; }
+          command -v python3 >/dev/null || command -v python >/dev/null || { echo "python needed (pkg install python)"; exit 1; }
+          PY=$(command -v python3 || command -v python)
+          
+          # ---------------------------------------------------------------- 1. reference
+          say "1/7 Fetching reference tree (partial, only needed blobs)"
+          git remote remove ref >/dev/null 2>&1
+          git remote add ref "$REF_URL"
+          git fetch --depth=1 --filter=blob:none ref "$REF_BRANCH" || { echo "fetch of reference failed"; exit 1; }
+          REF_PIN=$(git ls-tree "$REF" "$NEW_SM" | awk '{print $3}')
+          [ -n "$REF_PIN" ] && ok "reference pins BakaSU at $REF_PIN" || warn "could not read reference submodule pin; will use $BAKA_BRANCH HEAD"
+          
+          # ---------------------------------------------------------------- 2. submodule
+          say "2/7 Swapping submodule $OLD_SM -> $NEW_SM (BakaSU)"
+          if [ -e "$OLD_SM" ] || git ls-files --error-unmatch "$OLD_SM" >/dev/null 2>&1; then
+            git submodule deinit -f "$OLD_SM" >/dev/null 2>&1
+            git rm -f "$OLD_SM" >/dev/null 2>&1
+            rm -rf "$OLD_SM" ".git/modules/$OLD_SM"
+            ok "removed $OLD_SM"
+          fi
+          if ! git ls-files --error-unmatch "$NEW_SM" >/dev/null 2>&1; then
+            git submodule add -b "$BAKA_BRANCH" "$BAKA_URL" "$NEW_SM" || { echo "submodule add failed"; exit 1; }
+          fi
+          git submodule update --init --recursive "$NEW_SM"
+          if [ -n "$REF_PIN" ]; then
+            git -C "$NEW_SM" fetch --quiet origin "$REF_PIN" 2>/dev/null
+            git -C "$NEW_SM" checkout --quiet "$REF_PIN" && git add "$NEW_SM" && ok "pinned $NEW_SM to $REF_PIN (same as reference)"
+          fi
+          
+          # ---------------------------------------------------------------- 3. driver link
+          say "3/7 drivers/kernelsu symlink + Makefile + Kconfig"
+          rm -f drivers/kernelsu
+          ln -s "../$NEW_SM/kernel" drivers/kernelsu
+          git add -f drivers/kernelsu
+          grep -q 'CONFIG_KSU)' drivers/Makefile || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+            # insert before the final "endmenu"
+            $PY - <<'EOF'
+          p="drivers/Kconfig"
+          s=open(p).read().rstrip("\n").split("\n")
+          for i in range(len(s)-1,-1,-1):
+              if s[i].strip()=="endmenu":
+                  s.insert(i,'source "drivers/kernelsu/Kconfig"\n'); break
+          open(p,"w").write("\n".join(s)+"\n")
+          EOF
+          fi
+          ls -l drivers/kernelsu
+          grep -n 'kernelsu' drivers/Makefile drivers/Kconfig
+          
+          # ---------------------------------------------------------------- 4. defconfigs
+          say "4/7 Defconfigs (KSU lines copied from the reference where the same defconfig exists)"
+          DEFAULT_BLOCK=$'# BakaSU\nCONFIG_KSU=y\nCONFIG_KSU_MANUAL_HOOK=y'
+          CFGS=$(grep -rlE '^(# )?CONFIG_KSU' arch/arm64/configs 2>/dev/null)
+          if [ -z "$CFGS" ]; then
+            warn "no defconfig contains CONFIG_KSU. Your build script/workflow probably injects it - see step 7 output."
+          fi
+          for cfg in $CFGS; do
+            new=$(git show "$REF:$cfg" 2>/dev/null | grep -E '^(# )?CONFIG_KSU')
+            sed -i -E '/^(# )?CONFIG_KSU/d;/^# *KernelSU/d' "$cfg"
+            { echo "# BakaSU"; if [ -n "$new" ]; then echo "$new"; else echo "CONFIG_KSU=y"; echo "CONFIG_KSU_MANUAL_HOOK=y"; fi; } >> "$cfg"
+            echo "-- $cfg:"; grep -E '^(# )?CONFIG_KSU' "$cfg" | sed 's/^/     /'
+          done
+          
+          # ---------------------------------------------------------------- 5. hooks
+          say "5/7 Copying BakaSU hook hunks from the reference kernel"
+          cat > /tmp/hunkpick.py <<'EOF'
+          import subprocess, sys
+          mode, ref, path = sys.argv[1:4]
+          d = subprocess.run(["git","diff","--no-color","-U3","HEAD",ref,"--",path],
+                             capture_output=True, text=True).stdout
+          if not d.strip():
+              print("same"); sys.exit(0)
+          lines = d.split("\n")
+          if lines and lines[-1] == "": lines.pop()
+          i = 0
+          while i < len(lines) and not lines[i].startswith("@@"): i += 1
+          header, hunks, cur = lines[:i], [], None
+          for l in lines[i:]:
+              if l.startswith("@@"):
+                  cur = [l]; hunks.append(cur)
+              elif cur is not None:
+                  cur.append(l)
+          def keep(h):
+              if mode == "all": return True
+              return any(l[:1] in "+-" and "ksu" in l.lower() for l in h[1:])
+          sel = [h for h in hunks if keep(h)]
+          if not sel:
+              print("nothing"); sys.exit(0)
+          patch = "\n".join(header + [l for h in sel for l in h]) + "\n"
+          r = subprocess.run(["git","apply","--recount","--whitespace=nowarn","--reject","-"],
+                             input=patch, capture_output=True, text=True)
+          print("applied %d/%d hunks%s" % (len(sel), len(hunks), "" if r.returncode == 0 else "  (SOME REJECTED)"))
+          if r.returncode != 0: print(r.stderr.strip())
+          EOF
+          for f in $HOOKS_KSU_ONLY; do printf '%-36s ' "$f"; $PY /tmp/hunkpick.py ksu "$REF" "$f"; done
+          for f in $HOOKS_ALL;      do printf '%-36s ' "$f"; $PY /tmp/hunkpick.py all "$REF" "$f"; done
+          REJ=$(find . -name '*.rej' -not -path './.git/*' 2>/dev/null)
+          [ -n "$REJ" ] && { warn "rejected hunks (fix by hand or paste them to me):"; echo "$REJ"; }
+          
+          # ---------------------------------------------------------------- 6. build scripts / CI
+          say "6/7 References to the old submodule in build scripts / workflows"
+          grep -rnE "KernelSU-Next|KSU[-_ ]?Next|ksunext" build_kernel.sh build.sh .github 2>/dev/null \
+            || echo "none found"
+          echo
+          echo "(Fix manually: submodule path is now '$NEW_SM'; checkout needs 'submodules: recursive';"
+          echo " manager app is the BakaSU manager, not KernelSU-Next's.)"
+          
+          # ---------------------------------------------------------------- 7. audit
+          say "7/7 Audit - BakaSU fails the build if a required hook is missing"
+          need() { # symbol, dirs...
+            local s=$1; shift
+            if grep -rqs --include='*.c' "$s" "$@"; then ok "hook present: $s"; else warn "MISSING hook: $s"; fi
+          }
+          need ksu_handle_stat              fs
+          need ksu_handle_newfstat_ret      fs
+          need ksu_handle_execveat          fs
+          need ksu_handle_post_execveat     fs
+          need ksu_handle_faccessat         fs
+          need ksu_handle_sys_reboot        kernel
+          need ksu_handle_setresuid         kernel
+          need ksu_handle_sys_read          fs
+          need ksu_handle_input_handle_event drivers/input
+          echo
+          echo "Leftover KernelSU-Next style hooks (should be empty):"
+          grep -rnE --include='*.c' "ksu_execveat_hook|ksu_vfs_read_hook|ksu_handle_execveat_sucompat|ksu_handle_vfs_read|ksu_handle_setuid\b" fs kernel drivers/input security 2>/dev/null | head -20
+          echo
+          echo "SELinux symbols that must NOT be static:"
+          st() { grep -nE "^static[^;]*\b$2\b" "$1" >/dev/null 2>&1 && warn "$1: '$2' is still static"; }
+          st security/selinux/selinuxfs.c    'write_op'
+          st security/selinux/selinuxfs.c    'sel_handle_status_ops'
+          st security/selinux/selinuxfs.c    'sel_mutex'
+          st security/selinux/ss/services.c  'security_dump_masked_av'
+          st security/selinux/ss/services.c  'context_struct_compute_av'
+          st security/selinux/ss/services.c  'policy_rwlock'
+          st security/selinux/ss/status.c    'selinux_status_page'
+          st security/selinux/ss/status.c    'selinux_status_lock'
+          echo "(done - if nothing printed above the line, they are fine)"
+          
+          git remote remove ref >/dev/null 2>&1
+          echo
+          say "Finished. Next:  git status && git diff --stat   then commit (include the $NEW_SM gitlink + .gitmodules)."
+
+      - name: Show rejected hunks (if any) and clean up
+        run: |
+          find . -name '*.rej' -not -path './.git/*' -print -exec cat {} \; || true
+          find . -name '*.rej' -not -path './.git/*' -delete
+          find . -name '*.orig' -not -path './.git/*' -delete
+
+      - name: Commit and push to branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "${{ inputs.branch }}"
+          git add -A
+          git commit -m "Switch KernelSU-Next to BakaSU (manual hook)" || echo "nothing to commit"
+          git push -f origin "${{ inputs.branch }}"
