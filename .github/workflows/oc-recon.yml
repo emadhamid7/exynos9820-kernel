@@ -1,0 +1,55 @@
+name: OC recon (read-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to scan"
+        default: "bakasu-migration"
+
+jobs:
+  recon:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 1
+
+      - name: Find frequency / voltage / thermal tables
+        shell: bash {0}
+        run: |
+          S() { echo; echo "######## $*"; }
+          {
+          S "ECT / elts files"
+          ls -la .elts 2>/dev/null | head -20
+          find . -path ./.git -prune -o \( -iname '*ect*' -o -iname '*.elts' \) -type f -print 2>/dev/null | grep -viE 'select|detect|protect|connect|direct|effect|collect|object|inspect|correct' | head -20
+
+          S "CPU freqs (2730/2314/1950 MHz) in source"
+          grep -rnE --include='*.c' --include='*.h' --include='*.dtsi' --include='*.dts' \
+            -e '\b(2730000|2314000|2288000|1950000)\b' drivers arch/arm64/boot/dts include 2>/dev/null | head -60
+
+          S "GPU freqs (702 MHz) in source"
+          grep -rnE --include='*.c' --include='*.h' --include='*.dtsi' --include='*.dts' \
+            -e '\b702000\b|\b702\b.*(gpu|mali|clock|freq)|(gpu|mali).*\b702\b' drivers/gpu drivers/soc arch/arm64/boot/dts 2>/dev/null | head -60
+          grep -rnE 'gpu_max_clock|gpu_dvfs_table|max_clock|gpu_max' drivers/gpu 2>/dev/null | head -30
+
+          S "cal-if clock/voltage tables"
+          ls drivers/soc/samsung/cal-if/exynos9820 2>/dev/null
+          grep -rnE '2730|2314|1950|702' drivers/soc/samsung/cal-if/exynos9820 2>/dev/null | head -60
+
+          S "Thermal trips"
+          grep -rnE 'trip|temperature = <|hysteresis' arch/arm64/boot/dts/exynos/exynos9820*thermal* arch/arm64/boot/dts/exynos/exynos9820.dtsi 2>/dev/null | head -80
+          ls arch/arm64/boot/dts/exynos | grep -iE 'thermal|9820|9825' | head -30
+          grep -rnE 'thermal' drivers/thermal/samsung 2>/dev/null | grep -iE 'throttl|trip|temp' | head -20
+
+          S "cpufreq/EMS limits"
+          grep -rnE 'max_freq|min_freq|cpufreq_max|cpu_max' drivers/cpufreq drivers/soc/samsung/exynos-cpu_hotplug* kernel/sched/ems 2>/dev/null | head -30
+          } > recon.txt 2>&1
+          wc -l recon.txt
+          cat recon.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oc-recon
+          path: recon.txt
