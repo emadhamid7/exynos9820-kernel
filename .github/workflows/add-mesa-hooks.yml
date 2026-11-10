@@ -1,0 +1,35 @@
+name: add-mesa-hooks
+on:
+  push:
+    branches: [ksun-mesa]
+    paths: [.github/workflows/add-mesa-hooks.yml]
+permissions:
+  contents: write
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - run: |
+          set -e
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git fetch --depth=40 https://github.com/Mesazane/9820_kernel.git main:mesa
+          SHA=$(git log mesa --grep='scope_min_manual_hooks' -n1 --format=%H)
+          test -n "$SHA"
+          echo "Hooks commit: $SHA"
+          git show --stat --format=%s "$SHA" | head -30
+          git cherry-pick -x "$SHA" || { git diff --name-only --diff-filter=U; exit 1; }
+          git submodule set-url KernelSU-Next https://github.com/KernelSU-Next/KernelSU-Next
+          git config -f .gitmodules --unset submodule.KernelSU-Next.branch || true
+          git submodule sync
+          git submodule update --init --depth 1 KernelSU-Next
+          git -C KernelSU-Next fetch --depth 1 https://github.com/KernelSU-Next/KernelSU-Next.git d51ca52c6d370d8e9d62aabde10e41f17ff3ae94
+          git -C KernelSU-Next checkout FETCH_HEAD
+          git -C KernelSU-Next log -1 --format=%H
+          git add .gitmodules KernelSU-Next
+          git rm -q .github/workflows/add-mesa-hooks.yml
+          git commit -m "KernelSU-Next: pin d51ca52"
+          git push origin HEAD:ksun-mesa
