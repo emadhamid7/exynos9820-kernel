@@ -1,7 +1,7 @@
 name: add-mesa-hooks
 on:
   push:
-    branches: [ksun-mesa]
+    branches: [sixteen]
     paths: [.github/workflows/add-mesa-hooks.yml]
 permissions:
   contents: write
