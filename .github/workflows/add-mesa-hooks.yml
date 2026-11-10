@@ -21,7 +21,9 @@ jobs:
           test -n "$SHA"
           echo "Hooks commit: $SHA"
           git show --stat --format=%s "$SHA" | head -30
-          git cherry-pick -x "$SHA" || { git diff --name-only --diff-filter=U; exit 1; }
+          git cherry-pick -x -X theirs "$SHA" || { git diff --name-only --diff-filter=U; exit 1; }
+          echo "--- ksu lines in exec.c after merge ---"
+          grep -n -i ksu fs/exec.c
           git submodule set-url KernelSU-Next https://github.com/KernelSU-Next/KernelSU-Next
           git config -f .gitmodules --unset submodule.KernelSU-Next.branch || true
           git submodule sync
